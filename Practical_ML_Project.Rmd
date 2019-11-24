@@ -1,0 +1,183 @@
+---
+title: "Practical Machine Learning - Course Project"
+author: "Peter Cebo"
+date: "23/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. The goal is to predict the manner in which participants exercised. This is the "classe" variable in the training set, with 5 outcomes (A,B,C,D,E). 
+
+Data source: http:/groupware.les.inf.puc-rio.br/har.
+
+This report will describe:
+a) how the prediction models were built
+b) how cross validation was used 
+c) what the expected out of sample error is, and
+d) why the choices that were made, were made.
+
+Finally, the created model will be used to predict 20 test cases.
+
+## Cleaning and Prepping Data 
+
+```{r initialize}
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+dim(training)
+#head(training) (omitted here for brevity)
+
+length(which(sapply(training, anyNA)))
+training[training==""] <- NA
+useVar <- data.frame(seq_along(ncol(training)))
+denom <- nrow(training)
+
+for (i in 1:ncol(training)){
+  if(sum(is.na(training[,i]))/denom>0.9){
+    useVar[i]=FALSE
+    }
+  else{
+    useVar[i]=TRUE
+    }
+}
+
+training <- training[,useVar==TRUE]
+training <- training[,-(1:7)]
+dim(training)
+anyNA(training)
+```
+
+A large portion of the variables (columns) have a large proportion of blank values and/or NAs. Since we confirm this proportion to be very high (>90%), we decide to simply exclude those variables from the training set. We also drop the first 7 columns, since they are data about user names / timestamps etc. and will not be useful to us (and doing so will allow us to calculate things like correlation easily).
+
+The result is 53 variables and a "tidy" dataset, with no "NA" values.
+
+***Side Note: A look at the raw data in tabular form shows why many of the variables are missing data - they are present when "new_window" = "yes". This may be some sort of calibration data for each new measurement series and it might be useful to fill in the missing values with the values from the row of the same "num_window." For simplicity (and because we can't find documentation to confirm this), we choose to simply delete the variables.
+
+Next, we create a validation dataset using a 60/40 split.
+
+```{r Create Validation Set}
+suppressMessages(library(caret))
+inTrain = createDataPartition(training$classe, p = 0.6)[[1]]
+train <- training[inTrain,]
+validate <- training[-inTrain,]
+```
+
+## Exploratory Data Analysis
+
+Next, we do some quick exploratory data analysis, which will help us decide how to build our models (e.g. whether to use preProcess or not.)
+
+```{r EDA}
+
+#Using the same methodology as in a week 2 lecture example:
+M <- abs(cor(train[,-53]))
+diag(M) <- 0
+paste("There are", dim(which(M > 0.8, arr.ind=T))[1]/2, "variables that have a correlation of at least 0.8.")
+which(M > 0.95, arr.ind=T)
+par(mfrow=c(2,2))
+plot(train[,1],train[,4])
+plot(train[,10],train[,1])
+plot(train[,8],train[,2])
+plot(train[,4],train[,10])
+
+```
+
+## Building Model(s)
+
+Next, we train some models on our training (train) set. We use multiple methods, with the intention of comparing and potentially combining them later in our analysis. Since we found significant correlation among variables, we ensure use principal component analysis in building our models - this should help with speed of model building.
+
+```{r train}
+#First, enable parallel training (my PC has 8 cores)
+suppressMessages(library(doParallel))
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+rfModel <- train(classe ~ ., method="rf", preProcess="pca", data=train)
+bModel <- train(classe ~ ., method="gbm", preProcess="pca", data=train, verbose=FALSE)
+lModel <- train(classe ~ ., method="lda", preProcess="pca", data=train)
+tbModel <- train(classe ~ ., method="treebag", preProcess="pca", data=train)
+abModel <- train(classe ~ ., method="AdaBag", preProcess="pca", data=train)
+kModel <- train(classe ~ ., method="knn", preProcess="pca", data=train)
+
+rfPreds <- predict(rfModel, validate)
+bPreds <- predict(bModel, validate)
+lPreds <- predict(lModel, validate)
+tbPreds <- predict(tbModel, validate)
+abPreds <- predict(abModel, validate)
+kPreds <- predict(kModel, validate)
+
+#commented out for brevity
+#confusionMatrix(rfPreds, validate$classe)$overall[1]
+#confusionMatrix(bPreds, validate$classe)$overall[1]
+#confusionMatrix(lPreds, validate$classe)$overall[1]
+#confusionMatrix(tbPreds, validate$classe)$overall[1]
+#confusionMatrix(abPreds, validate$classe)$overall[1]
+#confusionMatrix(kPreds, validate$classe)$overall[1]
+
+predDF1 <- data.frame(rfPreds, bPreds, tbPreds, kPreds, classe=validate$classe)
+combModel1a <- train(classe ~ ., method="rf", data=predDF1)
+combPreds1a <- predict(combModel1a, validate)
+combModel1b <- suppressMessages(train(classe ~ ., method="gam", data=predDF1))
+combPreds1b <- predict(combModel1b, validate)
+predDF2 <- data.frame(rfPreds, bPreds, lPreds, tbPreds, abPreds, kPreds, classe=validate$classe)
+combModel2a <- train(classe ~ ., method="rf", data=predDF2)
+combPreds2a <- predict(combModel2a, validate)
+combModel2b <- train(classe ~ ., method="gam", data=predDF2)
+combPreds2b <- predict(combModel2b, validate)
+confusionMatrix(combPreds1a, validate$classe)$overall[1]
+confusionMatrix(combPreds1b, validate$classe)$overall[1]
+confusionMatrix(combPreds2a, validate$classe)$overall[1]
+confusionMatrix(combPreds2b, validate$classe)$overall[1]
+```
+
+After creating 6 models and combining them in 4 different ways, we choose combined model 1a. Though model 2a was very slightly more accurate during cross-validation, it is more computationally expensive and we (arbitrarily, admittedly) choose 1a as our winner.
+
+```{r Final Prediction on Test}
+
+rfPredsTest <- predict(rfModel, testing)
+bPredsTest <- predict(bModel, testing)
+tbPredsTest <- predict(tbModel, testing)
+kPredsTest <- predict(kModel, testing)
+
+#Not used - calculated for interest
+#lPredsTest <- predict(lModel, testing)
+#abPredsTest <- predict(abModel, testing)
+
+predDFTest <- data.frame(rfPreds=rfPredsTest, bPreds=bPredsTest, tbPreds=tbPredsTest, kPreds=kPredsTest)
+
+combPredTest <- predict(combModel1a, predDFTest)
+combPredTest
+
+```
+
+Finally, we find our predicted values on the testing set above.
+
+To summarrize:
+a) The final model was built by combining 4 various models which used 4 different model-building methods (rf, gbm, treebag and knn). We used random forest to combine models. 
+b) We subset the data into train and validate, cross-validating our model (60% train and 40% validate). In retrospect, this was likely a poor choice (vis a vis model accuracy) but it was an interesting exercise nonetheless, and the assignement asked for it specifically.
+c) The expected out of sample error rate is about 3% (Accuracy of chosen model is ~97%)
+d) In retrospect, it seems that the decision to use principle component analysis affected accuracy negatively as well - combining multiple models yielded worse results than a single random forest with no pca (see Appendix). However, this was a good learning exercise.
+
+## Appendix
+
+We build two final models. One on the full training set (no cross-validation), and one on the 60% train set, but with no PCA to compare its results. Naturally, both these models take much longer to train and so had the dataset been larger, they may not have been an option!
+
+Importantly however, they are both 100% accurate on the testing set. Our "best" model above was only 90% accurate on the testing set (vs. 97% expected). We chalk that up to randomness, as the testing sample was only 20 data points, after all.
+
+```{r One More Model on Full Training Set}
+
+fullTrainModel <- train(classe ~., method="rf", data=training)
+
+fullTrainModelPreds <- predict(fullTrainModel, testing)
+fullTrainModelPreds
+
+rfModelnoPCA <- train(classe ~ ., method="rf", data=train)
+rfModelnoPCAPreds <- predict(rfModelnoPCA, testing)
+rfModelnoPCAPreds
+```
+
+Thanks for reading!
